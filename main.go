@@ -2,11 +2,8 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
-	"crypto/cipher"
 	"crypto/tls"
-	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -22,7 +19,6 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/things-go/go-socks5"
-	"golang.org/x/crypto/chacha20poly1305"
 )
 
 type Config struct {
@@ -34,7 +30,6 @@ type Config struct {
 	QUICPortRange      string `json:"quic_port_range"`
 	LogLevel           string `json:"log_level"`
 	IdleTimeoutSeconds int    `json:"idle_timeout_seconds"`
-	PreSharedKey       string `json:"pre_shared_key"`
 }
 
 const (
@@ -82,20 +77,11 @@ func main() {
 	}
 	logLevel = strings.ToLower(cfg.LogLevel)
 
-	// Pastikan pre-shared key memiliki panjang 32 byte untuk ChaCha20-Poly1305.
-	var sharedKey []byte
-	if len(cfg.PreSharedKey) == 32 {
-		sharedKey = []byte(cfg.PreSharedKey)
-	} else {
-		// Fallback demo key (tidak aman untuk produksi)
-		sharedKey = []byte("0123456789abcdef0123456789abcdef")
-	}
-
 	switch strings.ToLower(cfg.Mode) {
 	case "server":
-		runServer(&cfg, sharedKey)
+		runServer(&cfg)
 	case "client":
-		runClient(&cfg, sharedKey)
+		runClient(&cfg)
 	default:
 		logf("error", "Mode tidak valid: %s", cfg.Mode)
 		os.Exit(1)
@@ -108,6 +94,7 @@ type streamConnWrapper struct {
 }
 
 func (s *streamConnWrapper) LocalAddr() net.Addr {
+	// Mengembalikan alamat dummy, karena quic.Stream tidak menyediakan informasi ini.
 	return &net.TCPAddr{IP: net.IPv4zero, Port: 0}
 }
 
@@ -127,7 +114,7 @@ func (s *streamConnWrapper) SetWriteDeadline(t time.Time) error {
 	return s.Stream.SetWriteDeadline(t)
 }
 
-func runServer(cfg *Config, sharedKey []byte) {
+func runServer(cfg *Config) {
 	tlsCert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
 	if err != nil {
 		logf("error", "Gagal load sertifikat TLS: %v", err)
@@ -151,6 +138,7 @@ func runServer(cfg *Config, sharedKey []byte) {
 	}
 	logf("info", "Server QUIC mendengarkan pada %s", cfg.QUICAddr)
 
+	// Tampilkan statistik koneksi secara periodik.
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
@@ -169,11 +157,12 @@ func runServer(cfg *Config, sharedKey []byte) {
 			logf("error", "Gagal menerima connection: %v", err)
 			continue
 		}
-		go handleQUICConnection(conn, cfg, sharedKey)
+		go handleQUICConnection(conn, cfg)
 	}
 }
 
-func handleQUICConnection(conn quic.Connection, cfg *Config, sharedKey []byte) {
+func handleQUICConnection(conn quic.Connection, cfg *Config) {
+	// Pastikan connection ditutup saat selesai.
 	defer conn.CloseWithError(0, "closed")
 	for {
 		stream, err := conn.AcceptStream(context.Background())
@@ -181,11 +170,11 @@ func handleQUICConnection(conn quic.Connection, cfg *Config, sharedKey []byte) {
 			logf("error", "Gagal menerima stream: %v", err)
 			return
 		}
-		go handleStream(stream, cfg, sharedKey)
+		go handleStream(stream, cfg)
 	}
 }
 
-// readHeader membaca satu baris (hingga '\n') dari conn dan mengembalikan sisa data yang telah ter-buffer.
+// readHeader membaca satu baris (hingga '\n') dari conn dan mengembalikan sisa data yang sudah ter-buffer.
 func readHeader(conn net.Conn) (header string, buffered net.Conn, err error) {
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadString('\n')
@@ -195,83 +184,76 @@ func readHeader(conn net.Conn) (header string, buffered net.Conn, err error) {
 	return strings.TrimSpace(line), &bufferedConn{Reader: reader, Conn: conn}, nil
 }
 
-func handleStream(stream quic.Stream, cfg *Config, sharedKey []byte) {
+func handleStream(stream quic.Stream, cfg *Config) {
 	atomic.AddInt64(&totalConn, 1)
 	atomic.AddInt64(&activeConn, 1)
+	// Pastikan stream selalu ditutup agar resource dilepas.
+	defer stream.Close()
 	defer atomic.AddInt64(&activeConn, -1)
 
 	// Bungkus stream dengan wrapper agar mendukung net.Conn.
 	connWrapper := &streamConnWrapper{stream}
-	// Header target dikirim plaintext untuk 0-RTT/0.5-RTT.
+
+	// Baca header target (alamat tujuan) yang dikirim secara plaintext.
 	target, bufferedStream, err := readHeader(connWrapper)
 	if err != nil {
 		atomic.AddInt64(&errorConn, 1)
 		logf("error", "Gagal membaca header target: %v", err)
-		stream.Close()
 		return
 	}
 
+	// Validasi format alamat.
 	if _, _, err := net.SplitHostPort(target); err != nil {
 		atomic.AddInt64(&errorConn, 1)
 		logf("error", "Alamat target tidak valid: %q (%v)", target, err)
-		stream.Close()
 		return
 	}
 
 	logf("info", "Meneruskan koneksi ke %s", target)
 
+	// Hubungkan ke target TCP.
 	tcpConn, err := net.Dial("tcp", target)
 	if err != nil {
 		atomic.AddInt64(&errorConn, 1)
 		logf("error", "Gagal menghubungkan ke %s: %v", target, err)
-		stream.Close()
 		return
 	}
 	defer tcpConn.Close()
 	atomic.AddInt64(&successConn, 1)
 
+	// Atur deadline jika dikonfigurasi.
 	if cfg.IdleTimeoutSeconds > 0 {
 		deadline := time.Now().Add(time.Duration(cfg.IdleTimeoutSeconds) * time.Second)
 		bufferedStream.SetDeadline(deadline)
 		tcpConn.SetDeadline(deadline)
 	}
 
-	// Bungkus koneksi sisa stream dengan enkripsi ChaCha20-Poly1305.
-	encryptedStream, err := newEncryptedConn(bufferedStream, sharedKey)
-	if err != nil {
-		logf("error", "Gagal membuat koneksi terenkripsi: %v", err)
-		stream.Close()
-		return
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Gunakan WaitGroup untuk transfer data dua arah.
+	var wg sync.WaitGroup
+	wg.Add(2)
 
 	go func() {
-		_, err := io.Copy(tcpConn, encryptedStream)
-		if err != nil {
-			logf("debug", "Encrypted QUIC → TCP error: %v", err)
+		defer wg.Done()
+		if _, err := io.Copy(tcpConn, bufferedStream); err != nil {
+			logf("debug", "QUIC → TCP error: %v", err)
 		}
-		cancel()
 	}()
 
 	go func() {
-		_, err := io.Copy(encryptedStream, tcpConn)
-		if err != nil {
-			logf("debug", "TCP → Encrypted QUIC error: %v", err)
+		defer wg.Done()
+		if _, err := io.Copy(bufferedStream, tcpConn); err != nil {
+			logf("debug", "TCP → QUIC error: %v", err)
 		}
-		cancel()
 	}()
 
-	<-ctx.Done()
+	wg.Wait()
 	logf("debug", "Selesai koneksi ke %s", target)
 }
 
-func runClient(cfg *Config, sharedKey []byte) {
+func runClient(cfg *Config) {
 	dialer := &QUICDialer{
 		quicAddr:  cfg.QUICAddr,
 		portRange: cfg.QUICPortRange,
-		sharedKey: sharedKey,
 		idleSec:   cfg.IdleTimeoutSeconds,
 	}
 
@@ -289,7 +271,6 @@ func runClient(cfg *Config, sharedKey []byte) {
 type QUICDialer struct {
 	quicAddr  string
 	portRange string
-	sharedKey []byte
 	idleSec   int
 }
 
@@ -300,6 +281,7 @@ func (d *QUICDialer) Dial(ctx context.Context, network, addr string) (net.Conn, 
 		return nil, fmt.Errorf("invalid port range: %v", err)
 	}
 
+	// Pilih port secara acak dalam rentang yang diberikan.
 	port := rand.Intn(maxPort-minPort+1) + minPort
 	targetAddr := fmt.Sprintf("%s:%d", strings.Split(d.quicAddr, ":")[0], port)
 
@@ -324,22 +306,15 @@ func (d *QUICDialer) Dial(ctx context.Context, network, addr string) (net.Conn, 
 		return nil, err
 	}
 
-	// Kirim header target address secara plaintext untuk 0-RTT/early data.
+	// Kirim header target address secara plaintext untuk mendukung 0-RTT/early data.
 	if _, err := stream.Write([]byte(addr + "\n")); err != nil {
 		stream.Close()
 		return nil, err
 	}
 
-	// Bungkus stream dengan wrapper agar bisa digunakan sebagai net.Conn,
-	// lalu bungkus lagi dengan enkripsi ChaCha20-Poly1305.
+	// Bungkus stream dengan wrapper agar bisa digunakan sebagai net.Conn.
 	connWrapper := &streamConnWrapper{stream}
-	encryptedStream, err := newEncryptedConn(connWrapper, d.sharedKey)
-	if err != nil {
-		stream.Close()
-		return nil, err
-	}
-
-	return &quicStreamConn{Stream: stream, sess: conn, wrapped: encryptedStream}, nil
+	return &quicStreamConn{Stream: stream, sess: conn, wrapped: connWrapper}, nil
 }
 
 type quicStreamConn struct {
@@ -381,107 +356,6 @@ func (c *quicStreamConn) SetReadDeadline(t time.Time) error {
 func (c *quicStreamConn) SetWriteDeadline(t time.Time) error {
 	return c.wrapped.SetWriteDeadline(t)
 }
-
-// ---- Implementasi encryptedConn ----
-
-type encryptedConn struct {
-	conn         net.Conn
-	aead         cipher.AEAD
-	writeMutex   sync.Mutex
-	readMutex    sync.Mutex
-	readBuf      bytes.Buffer
-	writeCounter uint64
-}
-
-func newEncryptedConn(conn net.Conn, key []byte) (net.Conn, error) {
-	aead, err := chacha20poly1305.New(key)
-	if err != nil {
-		return nil, err
-	}
-	return &encryptedConn{
-		conn: conn,
-		aead: aead,
-	}, nil
-}
-
-func (ec *encryptedConn) Read(p []byte) (int, error) {
-	ec.readMutex.Lock()
-	defer ec.readMutex.Unlock()
-
-	if ec.readBuf.Len() > 0 {
-		return ec.readBuf.Read(p)
-	}
-
-	lenBytes := make([]byte, 4)
-	if _, err := io.ReadFull(ec.conn, lenBytes); err != nil {
-		return 0, err
-	}
-	msgLen := binary.BigEndian.Uint32(lenBytes)
-	if msgLen < uint32(ec.aead.NonceSize()) {
-		return 0, fmt.Errorf("pesan terenkripsi terlalu pendek")
-	}
-
-	encData := make([]byte, msgLen)
-	if _, err := io.ReadFull(ec.conn, encData); err != nil {
-		return 0, err
-	}
-	nonce := encData[:ec.aead.NonceSize()]
-	ciphertext := encData[ec.aead.NonceSize():]
-	plaintext, err := ec.aead.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return 0, err
-	}
-	ec.readBuf.Write(plaintext)
-	return ec.readBuf.Read(p)
-}
-
-func (ec *encryptedConn) Write(p []byte) (int, error) {
-	ec.writeMutex.Lock()
-	defer ec.writeMutex.Unlock()
-
-	nonce := make([]byte, ec.aead.NonceSize())
-	// 4 byte pertama tetap 0, 8 byte berikutnya dari counter.
-	binary.BigEndian.PutUint64(nonce[4:], ec.writeCounter)
-	ec.writeCounter++
-
-	ciphertext := ec.aead.Seal(nil, nonce, p, nil)
-	msg := append(nonce, ciphertext...)
-	lenBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBytes, uint32(len(msg)))
-	if _, err := ec.conn.Write(lenBytes); err != nil {
-		return 0, err
-	}
-	if _, err := ec.conn.Write(msg); err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}
-
-func (ec *encryptedConn) Close() error {
-	return ec.conn.Close()
-}
-
-func (ec *encryptedConn) LocalAddr() net.Addr {
-	return ec.conn.LocalAddr()
-}
-
-func (ec *encryptedConn) RemoteAddr() net.Addr {
-	return ec.conn.RemoteAddr()
-}
-
-func (ec *encryptedConn) SetDeadline(t time.Time) error {
-	return ec.conn.SetDeadline(t)
-}
-
-func (ec *encryptedConn) SetReadDeadline(t time.Time) error {
-	return ec.conn.SetReadDeadline(t)
-}
-
-func (ec *encryptedConn) SetWriteDeadline(t time.Time) error {
-	return ec.conn.SetWriteDeadline(t)
-}
-
-// ---- Buffered connection wrapper agar data yang sudah ter-read oleh bufio.Reader tidak hilang ----
 
 type bufferedConn struct {
 	Reader *bufio.Reader

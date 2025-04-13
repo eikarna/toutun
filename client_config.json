@@ -4,6 +4,7 @@
   "quic_port_range": "1-65535",
   "socks_addr": ":5080",
   "log_level": "debug",
-  "idle_timeout_seconds": 5,
-  "pre_shared_key": "49a14e33385e7d5bd971d803cb708bc1"
+  "tls_cert_file": "server.crt",
+  "tls_key_file": "server.key",
+  "idle_timeout_seconds": 5
 }
