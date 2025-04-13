@@ -1,0 +1,8 @@
+{
+  "mode": "server",
+  "quic_addr": ":12345",
+  "tls_cert_file": "server.crt",
+  "tls_key_file": "server.key",
+  "log_level": "debug",
+  "idle_timeout_seconds": 5
+}

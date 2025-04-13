@@ -1,0 +1,9 @@
+{
+  "mode": "client",
+  "quic_addr": "47.236.19.159",
+  "quic_port_range": "1-65535",
+  "socks_addr": ":5080",
+  "log_level": "debug",
+  "idle_timeout_seconds": 5,
+  "stateless": true
+}
