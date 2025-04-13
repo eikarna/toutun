@@ -96,7 +96,7 @@ func runServer(cfg *Config) {
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
-		NextProtos:   []string{"quic-tunnel"},
+		NextProtos:   []string{"toutun"},
 	}
 
 	listener, err := quic.ListenAddr(cfg.QUICAddr, tlsConfig, nil)
@@ -236,7 +236,7 @@ func (d *QUICDialer) Dial(ctx context.Context, network, addr string) (net.Conn, 
 
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
-		NextProtos:         []string{"quic-tunnel"},
+		NextProtos:         []string{"toutun"},
 	}
 
 	conn, err := quic.DialAddr(ctx, targetAddr, tlsConfig, nil)
