@@ -6,30 +6,30 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/quic-go/quic-go"
+	quic "github.com/quic-go/quic-go"
 	"github.com/things-go/go-socks5"
 )
 
+// Config adalah struktur konfigurasi yang diambil dari file JSON.
 type Config struct {
 	Mode               string `json:"mode"`
 	QUICAddr           string `json:"quic_addr"`
 	TLSCertFile        string `json:"tls_cert_file"`
 	TLSKeyFile         string `json:"tls_key_file"`
 	SocksAddr          string `json:"socks_addr"`
-	QUICPortRange      string `json:"quic_port_range"`
 	LogLevel           string `json:"log_level"`
 	IdleTimeoutSeconds int    `json:"idle_timeout_seconds"`
 }
+
+var config Config
 
 const (
 	LogLevelDebug = "debug"
@@ -38,13 +38,7 @@ const (
 	LogLevelError = "error"
 )
 
-var (
-	logLevel    = LogLevelInfo
-	totalConn   int64
-	activeConn  int64
-	successConn int64
-	errorConn   int64
-)
+var logLevel = LogLevelInfo
 
 func logf(level string, format string, v ...interface{}) {
 	allowed := map[string]int{
@@ -58,51 +52,52 @@ func logf(level string, format string, v ...interface{}) {
 	}
 }
 
+var (
+	totalConn   int64
+	activeConn  int64
+	successConn int64
+	errorConn   int64
+)
+
 func main() {
 	configFile := flag.String("config", "config.json", "Path ke file konfigurasi JSON")
 	flag.Parse()
 
 	file, err := os.Open(*configFile)
 	if err != nil {
-		logf("error", "Gagal membuka file konfigurasi: %v", err)
-		os.Exit(1)
+		log.Fatalf("Gagal membuka file konfigurasi: %v", err)
 	}
 	defer file.Close()
 
-	var cfg Config
-	if err := json.NewDecoder(file).Decode(&cfg); err != nil {
-		logf("error", "Gagal decode konfigurasi: %v", err)
-		os.Exit(1)
+	if err := json.NewDecoder(file).Decode(&config); err != nil {
+		log.Fatalf("Gagal decode konfigurasi: %v", err)
 	}
-	logLevel = strings.ToLower(cfg.LogLevel)
+	logLevel = strings.ToLower(config.LogLevel)
 
-	switch strings.ToLower(cfg.Mode) {
+	switch strings.ToLower(config.Mode) {
 	case "server":
-		runServer(&cfg)
+		runServer(&config)
 	case "client":
-		runClient(&cfg)
+		runClient(&config)
 	default:
-		logf("error", "Mode tidak valid: %s", cfg.Mode)
-		os.Exit(1)
+		log.Fatalf("Mode tidak valid: %s", config.Mode)
 	}
+
 }
 
 func runServer(cfg *Config) {
 	tlsCert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
 	if err != nil {
-		logf("error", "Gagal load sertifikat TLS: %v", err)
-		os.Exit(1)
+		log.Fatalf("Gagal load sertifikat TLS: %v", err)
 	}
-
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
-		NextProtos:   []string{"toutun"},
+		NextProtos:   []string{"quic-tunnel"},
 	}
 
 	listener, err := quic.ListenAddr(cfg.QUICAddr, tlsConfig, nil)
 	if err != nil {
-		logf("error", "Gagal listen pada %s: %v", cfg.QUICAddr, err)
-		os.Exit(1)
+		log.Fatalf("Gagal listen pada %s: %v", cfg.QUICAddr, err)
 	}
 	logf("info", "Server QUIC mendengarkan pada %s", cfg.QUICAddr)
 
@@ -124,23 +119,24 @@ func runServer(cfg *Config) {
 			logf("error", "Gagal menerima connection: %v", err)
 			continue
 		}
-		go handleQUICConnection(conn, cfg)
+		go handleQUICConnection(conn)
 	}
+
 }
 
-func handleQUICConnection(conn quic.Connection, cfg *Config) {
-	defer conn.CloseWithError(0, "closed")
+func handleQUICConnection(conn quic.Connection) {
+	defer conn.CloseWithError(0, "menutup connection")
 	for {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
 			logf("error", "Gagal menerima stream: %v", err)
 			return
 		}
-		go handleStream(stream, cfg)
+		go handleStream(stream)
 	}
 }
 
-func handleStream(stream quic.Stream, cfg *Config) {
+func handleStream(stream quic.Stream) {
 	atomic.AddInt64(&totalConn, 1)
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
@@ -153,7 +149,6 @@ func handleStream(stream quic.Stream, cfg *Config) {
 		logf("error", "Gagal membaca alamat tujuan: %v", err)
 		return
 	}
-
 	target := strings.TrimSpace(targetLine)
 	if _, _, err := net.SplitHostPort(target); err != nil {
 		atomic.AddInt64(&errorConn, 1)
@@ -172,11 +167,9 @@ func handleStream(stream quic.Stream, cfg *Config) {
 	defer tcpConn.Close()
 	atomic.AddInt64(&successConn, 1)
 
-	if cfg.IdleTimeoutSeconds > 0 {
-		deadline := time.Now().Add(time.Duration(cfg.IdleTimeoutSeconds) * time.Second)
-		stream.SetDeadline(deadline)
-		tcpConn.SetDeadline(deadline)
-	}
+	deadline := time.Now().Add(time.Duration(config.IdleTimeoutSeconds) * time.Second)
+	_ = stream.SetDeadline(deadline)
+	_ = tcpConn.SetDeadline(deadline)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -188,7 +181,6 @@ func handleStream(stream quic.Stream, cfg *Config) {
 		}
 		cancel()
 	}()
-
 	go func() {
 		_, err := io.Copy(stream, tcpConn)
 		if err != nil {
@@ -199,63 +191,48 @@ func handleStream(stream quic.Stream, cfg *Config) {
 
 	<-ctx.Done()
 	logf("debug", "Selesai koneksi ke %s", target)
+
 }
 
 func runClient(cfg *Config) {
-	dialer := &QUICDialer{
-		quicAddr:  cfg.QUICAddr,
-		portRange: cfg.QUICPortRange,
-	}
+	dialer := &QUICDialer{quicAddr: cfg.QUICAddr}
 
-	socksServer := socks5.NewServer(
-		socks5.WithDial(dialer.Dial),
-	)
+	socksServer := socks5.NewServer(socks5.WithDial(dialer.Dial))
 
-	logf("info", "Client SOCKS5 mendengarkan pada %s", cfg.SocksAddr)
+	log.Printf("Client SOCKS5 mendengarkan pada %s", cfg.SocksAddr)
 	if err := socksServer.ListenAndServe("tcp", cfg.SocksAddr); err != nil {
-		logf("error", "Error menjalankan SOCKS5 server: %v", err)
-		os.Exit(1)
+		log.Fatalf("Error menjalankan SOCKS5 server: %v", err)
 	}
 }
 
-type QUICDialer struct {
-	quicAddr  string
-	portRange string
-}
+// QUICDialer digunakan oleh SOCKS5 server untuk membuat koneksi tunnel ke server QUIC.
+type QUICDialer struct{ quicAddr string }
 
 func (d *QUICDialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	var minPort, maxPort int
-	_, err := fmt.Sscanf(d.portRange, "%d-%d", &minPort, &maxPort)
-	if err != nil {
-		return nil, fmt.Errorf("invalid port range: %v", err)
-	}
+	tlsConfig := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"quic-tunnel"}}
 
-	// Generate random port dalam range yang ditentukan
-	port := rand.Intn(maxPort-minPort+1) + minPort
-	targetAddr := fmt.Sprintf("%s:%d", strings.Split(d.quicAddr, ":")[0], port)
-
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"toutun"},
-	}
-
-	conn, err := quic.DialAddr(ctx, targetAddr, tlsConfig, nil)
+	conn, err := quic.DialAddr(context.Background(), d.quicAddr, tlsConfig, nil)
 	if err != nil {
 		return nil, err
 	}
 
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		conn.CloseWithError(0, "stream failed")
+		conn.CloseWithError(0, "gagal membuka stream")
 		return nil, err
 	}
 
-	if _, err := stream.Write([]byte(addr + "\n")); err != nil {
+	_, err = stream.Write([]byte(addr + "\n"))
+	if err != nil {
 		stream.Close()
 		return nil, err
 	}
 
-	return &quicStreamConn{Stream: stream, sess: conn}, nil
+	return &quicStreamConn{
+		Stream: stream,
+		sess:   conn,
+	}, nil
+
 }
 
 type quicStreamConn struct {
@@ -263,21 +240,15 @@ type quicStreamConn struct {
 	sess quic.Connection
 }
 
-func (c *quicStreamConn) Close() error {
-	err := c.Stream.Close()
-	c.sess.CloseWithError(0, "closed")
-	return err
+func (c *quicStreamConn) LocalAddr() net.Addr {
+	addr := c.sess.LocalAddr().(*net.UDPAddr)
+	return &net.TCPAddr{IP: addr.IP, Port: addr.Port, Zone: ""}
 }
 
-func (c *quicStreamConn) LocalAddr() net.Addr {
-	if udpAddr, ok := c.sess.LocalAddr().(*net.UDPAddr); ok {
-		return &net.TCPAddr{
-			IP:   udpAddr.IP,
-			Port: udpAddr.Port,
-			Zone: udpAddr.Zone,
-		}
-	}
-	return &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+func (c *quicStreamConn) Close() error {
+	err := c.Stream.Close()
+	c.sess.CloseWithError(0, "menutup connection")
+	return err
 }
 
 func (c *quicStreamConn) RemoteAddr() net.Addr {

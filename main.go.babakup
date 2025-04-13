@@ -9,15 +9,15 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/armon/go-socks5"
 	"github.com/quic-go/quic-go"
-	"github.com/things-go/go-socks5"
 )
 
 type Config struct {
@@ -32,18 +32,20 @@ type Config struct {
 }
 
 const (
-	LogLevelDebug = "debug"
-	LogLevelInfo  = "info"
-	LogLevelWarn  = "warn"
-	LogLevelError = "error"
+	LogLevelDebug    = "debug"
+	LogLevelInfo     = "info"
+	LogLevelWarn     = "warn"
+	LogLevelError    = "error"
+	initialChunkSize = 2048
 )
 
 var (
-	logLevel    = LogLevelInfo
-	totalConn   int64
-	activeConn  int64
-	successConn int64
-	errorConn   int64
+	logLevel     = LogLevelInfo
+	totalConn    int64
+	activeConn   int64
+	successConn  int64
+	errorConn    int64
+	sessionCache sync.Map
 )
 
 func logf(level string, format string, v ...interface{}) {
@@ -96,7 +98,7 @@ func runServer(cfg *Config) {
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
-		NextProtos:   []string{"toutun"},
+		NextProtos:   []string{"quic-tunnel"},
 	}
 
 	listener, err := quic.ListenAddr(cfg.QUICAddr, tlsConfig, nil)
@@ -124,12 +126,26 @@ func runServer(cfg *Config) {
 			logf("error", "Gagal menerima connection: %v", err)
 			continue
 		}
-		go handleQUICConnection(conn, cfg)
+		if cfg.Stateless {
+			go handleQUICConnectionStateless(conn, cfg)
+		} else {
+			go handleQUICConnectionStateful(conn, cfg)
+		}
 	}
 }
 
-func handleQUICConnection(conn quic.Connection, cfg *Config) {
-	defer conn.CloseWithError(0, "closed")
+func handleQUICConnectionStateless(conn quic.Connection, cfg *Config) {
+	defer conn.CloseWithError(0, "done")
+	stream, err := conn.AcceptStream(context.Background())
+	if err != nil {
+		logf("error", "Gagal menerima stream: %v", err)
+		return
+	}
+	handleStatelessPacket(stream, cfg)
+}
+
+func handleQUICConnectionStateful(conn quic.Connection, cfg *Config) {
+	defer conn.CloseWithError(0, "menutup connection")
 	for {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
@@ -202,60 +218,35 @@ func handleStream(stream quic.Stream, cfg *Config) {
 }
 
 func runClient(cfg *Config) {
-	dialer := &QUICDialer{
-		quicAddr:  cfg.QUICAddr,
-		portRange: cfg.QUICPortRange,
+	var startPort, endPort int
+	if cfg.Stateless {
+		_, err := fmt.Sscanf(cfg.QUICPortRange, "%d-%d", &startPort, &endPort)
+		if err != nil {
+			logf("error", "Invalid QUIC port range: %v", err)
+			os.Exit(1)
+		}
 	}
 
-	socksServer := socks5.NewServer(
-		socks5.WithDial(dialer.Dial),
-	)
+	socksConf := &socks5.Config{
+		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if cfg.Stateless {
+				return statelessConn(addr, cfg, startPort, endPort)
+			}
+			return (&QUICDialer{quicAddr: cfg.QUICAddr}).Dial(ctx, network, addr)
+		},
+	}
+
+	socksServer, err := socks5.New(socksConf)
+	if err != nil {
+		logf("error", "Gagal membuat SOCKS5 server: %v", err)
+		os.Exit(1)
+	}
 
 	logf("info", "Client SOCKS5 mendengarkan pada %s", cfg.SocksAddr)
 	if err := socksServer.ListenAndServe("tcp", cfg.SocksAddr); err != nil {
 		logf("error", "Error menjalankan SOCKS5 server: %v", err)
 		os.Exit(1)
 	}
-}
-
-type QUICDialer struct {
-	quicAddr  string
-	portRange string
-}
-
-func (d *QUICDialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	var minPort, maxPort int
-	_, err := fmt.Sscanf(d.portRange, "%d-%d", &minPort, &maxPort)
-	if err != nil {
-		return nil, fmt.Errorf("invalid port range: %v", err)
-	}
-
-	// Generate random port dalam range yang ditentukan
-	port := rand.Intn(maxPort-minPort+1) + minPort
-	targetAddr := fmt.Sprintf("%s:%d", strings.Split(d.quicAddr, ":")[0], port)
-
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"toutun"},
-	}
-
-	conn, err := quic.DialAddr(ctx, targetAddr, tlsConfig, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	stream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		conn.CloseWithError(0, "stream failed")
-		return nil, err
-	}
-
-	if _, err := stream.Write([]byte(addr + "\n")); err != nil {
-		stream.Close()
-		return nil, err
-	}
-
-	return &quicStreamConn{Stream: stream, sess: conn}, nil
 }
 
 type quicStreamConn struct {
@@ -265,7 +256,7 @@ type quicStreamConn struct {
 
 func (c *quicStreamConn) Close() error {
 	err := c.Stream.Close()
-	c.sess.CloseWithError(0, "closed")
+	c.sess.CloseWithError(0, "menutup connection")
 	return err
 }
 
@@ -281,7 +272,14 @@ func (c *quicStreamConn) LocalAddr() net.Addr {
 }
 
 func (c *quicStreamConn) RemoteAddr() net.Addr {
-	return c.sess.RemoteAddr()
+	if udpAddr, ok := c.sess.RemoteAddr().(*net.UDPAddr); ok {
+		return &net.TCPAddr{
+			IP:   udpAddr.IP,
+			Port: udpAddr.Port,
+			Zone: udpAddr.Zone,
+		}
+	}
+	return &net.TCPAddr{IP: net.IPv4zero, Port: 0}
 }
 
 func (c *quicStreamConn) SetDeadline(t time.Time) error {
@@ -294,4 +292,31 @@ func (c *quicStreamConn) SetReadDeadline(t time.Time) error {
 
 func (c *quicStreamConn) SetWriteDeadline(t time.Time) error {
 	return c.Stream.SetWriteDeadline(t)
+}
+
+type QUICDialer struct{ quicAddr string }
+
+func (d *QUICDialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"quic-tunnel"},
+	}
+
+	conn, err := quic.DialAddr(ctx, d.quicAddr, tlsConfig, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		conn.CloseWithError(0, "gagal membuka stream")
+		return nil, err
+	}
+
+	if _, err := stream.Write([]byte(addr + "\n")); err != nil {
+		stream.Close()
+		return nil, err
+	}
+
+	return &quicStreamConn{Stream: stream, sess: conn}, nil
 }

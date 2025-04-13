@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -29,6 +30,10 @@ type Config struct {
 	QUICPortRange      string `json:"quic_port_range"`
 	LogLevel           string `json:"log_level"`
 	IdleTimeoutSeconds int    `json:"idle_timeout_seconds"`
+	ObfsPassword       string `json:"obfs_password"`
+	EnableFakeTLS      bool   `json:"enable_fake_tls"`
+	PaddingSize        int    `json:"padding_size"`
+	EnableDummyPacket  bool   `json:"enable_dummy_packet"`
 }
 
 const (
@@ -96,10 +101,23 @@ func runServer(cfg *Config) {
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
-		NextProtos:   []string{"toutun"},
 	}
 
-	listener, err := quic.ListenAddr(cfg.QUICAddr, tlsConfig, nil)
+	quicConfig := &quic.Config{
+		MaxIdleTimeout:                 30 * time.Second,
+		KeepAlivePeriod:                0,
+		MaxIncomingStreams:             1 << 20,
+		InitialStreamReceiveWindow:     4 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 4 * 1024 * 1024,
+	}
+
+	if cfg.EnableFakeTLS {
+		tlsConfig.NextProtos = []string{"http/1.1"}
+	} else {
+		tlsConfig.NextProtos = []string{"toutun"}
+	}
+
+	listener, err := quic.ListenAddr(cfg.QUICAddr, tlsConfig, quicConfig)
 	if err != nil {
 		logf("error", "Gagal listen pada %s: %v", cfg.QUICAddr, err)
 		os.Exit(1)
@@ -146,7 +164,28 @@ func handleStream(stream quic.Stream, cfg *Config) {
 	defer atomic.AddInt64(&activeConn, -1)
 	defer stream.Close()
 
-	reader := bufio.NewReader(stream)
+	var reader *bufio.Reader
+
+	if cfg.ObfsPassword != "" {
+		// Membaca data awal dan de-obfuscate
+		buf := make([]byte, 4096)
+		n, _ := stream.Read(buf)
+		buf = deobfuscate(buf[:n], cfg.ObfsPassword)
+
+		// Gunakan bytes.NewReader agar []byte menjadi io.Reader
+		reader = bufio.NewReader(bytes.NewReader(buf))
+	} else if cfg.PaddingSize > 0 {
+		// Membaca data awal dan de-padding
+		buf := make([]byte, 4096+cfg.PaddingSize) // Ukuran buffer ditambah padding maks
+		n, _ := stream.Read(buf)
+		buf = removePadding(buf[:n], cfg.PaddingSize)
+
+		// Gunakan bytes.NewReader agar []byte menjadi io.Reader
+		reader = bufio.NewReader(bytes.NewReader(buf))
+	} else {
+		reader = bufio.NewReader(stream)
+	}
+
 	targetLine, err := reader.ReadString('\n')
 	if err != nil {
 		atomic.AddInt64(&errorConn, 1)
@@ -201,10 +240,16 @@ func handleStream(stream quic.Stream, cfg *Config) {
 	logf("debug", "Selesai koneksi ke %s", target)
 }
 
+// Tambahkan fungsi deobfuscate (sama dengan obfuscate karena XOR simetris)
+func deobfuscate(data []byte, key string) []byte {
+	return obfuscate(data, key)
+}
+
 func runClient(cfg *Config) {
 	dialer := &QUICDialer{
 		quicAddr:  cfg.QUICAddr,
 		portRange: cfg.QUICPortRange,
+		cfg:       cfg,
 	}
 
 	socksServer := socks5.NewServer(
@@ -221,6 +266,7 @@ func runClient(cfg *Config) {
 type QUICDialer struct {
 	quicAddr  string
 	portRange string
+	cfg       *Config
 }
 
 func (d *QUICDialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -232,14 +278,28 @@ func (d *QUICDialer) Dial(ctx context.Context, network, addr string) (net.Conn, 
 
 	// Generate random port dalam range yang ditentukan
 	port := rand.Intn(maxPort-minPort+1) + minPort
-	targetAddr := fmt.Sprintf("%s:%d", strings.Split(d.quicAddr, ":")[0], port)
+	// Gunakan IP dari d.quicAddr dan port yang dipilih
+	host := strings.Split(d.quicAddr, ":")[0]
+	targetAddr := fmt.Sprintf("%s:%d", host, port)
 
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
-		NextProtos:         []string{"toutun"},
 	}
 
-	conn, err := quic.DialAddr(ctx, targetAddr, tlsConfig, nil)
+	if d.cfg.EnableFakeTLS {
+		tlsConfig.NextProtos = []string{"http/1.1"}
+	} else {
+		tlsConfig.NextProtos = []string{"toutun"}
+	}
+
+	quicConfig := &quic.Config{
+		HandshakeIdleTimeout: 8 * time.Second,
+		MaxIdleTimeout:       15 * time.Second,
+		KeepAlivePeriod:      0,
+	}
+
+	// Menggunakan quic.DialAddr dengan targetAddr yang sudah dibuat
+	conn, err := quic.DialAddr(ctx, targetAddr, tlsConfig, quicConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -250,23 +310,61 @@ func (d *QUICDialer) Dial(ctx context.Context, network, addr string) (net.Conn, 
 		return nil, err
 	}
 
+	// Menulis alamat target untuk SOCKS5
 	if _, err := stream.Write([]byte(addr + "\n")); err != nil {
 		stream.Close()
 		return nil, err
 	}
 
-	return &quicStreamConn{Stream: stream, sess: conn}, nil
+	// Menambahkan payload obfuscasi jika diperlukan
+	if d.cfg.ObfsPassword != "" {
+		obfsPayload := generateObfsPayload(d.cfg.PaddingSize, d.cfg.ObfsPassword)
+		if _, err := stream.Write(obfsPayload); err != nil {
+			return nil, err
+		}
+	}
+
+	return &quicStreamConn{
+		Stream: stream,
+		sess:   conn,
+		cfg:    d.cfg,
+	}, nil
 }
 
 type quicStreamConn struct {
 	quic.Stream
 	sess quic.Connection
+	cfg  *Config
 }
 
 func (c *quicStreamConn) Close() error {
 	err := c.Stream.Close()
 	c.sess.CloseWithError(0, "closed")
 	return err
+}
+
+func (c *quicStreamConn) Read(b []byte) (n int, err error) {
+	n, err = c.Stream.Read(b)
+	if c.cfg.ObfsPassword != "" {
+		// Pastikan hanya meng-deobfuscate data yang telah diterima
+		deobfuscated := deobfuscate(b[:n], c.cfg.ObfsPassword)
+		copy(b, deobfuscated)
+	}
+	if c.cfg.PaddingSize > 0 {
+		unPadded := removePadding(b, c.cfg.PaddingSize)
+		copy(b, unPadded)
+	}
+	return n, err
+}
+
+func (c *quicStreamConn) Write(b []byte) (n int, err error) {
+	if c.cfg.ObfsPassword != "" {
+		b = obfuscate(b, c.cfg.ObfsPassword)
+	}
+	if c.cfg.PaddingSize > 0 {
+		b = addPadding(b, c.cfg.PaddingSize)
+	}
+	return c.Stream.Write(b)
 }
 
 func (c *quicStreamConn) LocalAddr() net.Addr {
@@ -294,4 +392,41 @@ func (c *quicStreamConn) SetReadDeadline(t time.Time) error {
 
 func (c *quicStreamConn) SetWriteDeadline(t time.Time) error {
 	return c.Stream.SetWriteDeadline(t)
+}
+
+func generateObfsPayload(paddingSize int, password string) []byte {
+	buf := new(bytes.Buffer)
+	if paddingSize > 0 {
+		buf.Write(generateRandomBytes(paddingSize))
+	}
+	buf.WriteString("GET / HTTP/1.1\r\n\r\n")
+	return obfuscate(buf.Bytes(), password)
+}
+
+func obfuscate(data []byte, key string) []byte {
+	obfs := make([]byte, len(data))
+	k := []byte(key)
+	for i := 0; i < len(data); i++ {
+		obfs[i] = data[i] ^ k[i%len(k)]
+	}
+	return obfs
+}
+
+func addPadding(data []byte, maxSize int) []byte {
+	padded := make([]byte, len(data)+maxSize)
+	copy(padded, data)
+	rand.Read(padded[len(data):])
+	return padded
+}
+
+func removePadding(data []byte, maxSize int) []byte {
+	return data[maxSize:]
+}
+
+func generateRandomBytes(n int) []byte {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		log.Printf("Gagal menghasilkan random bytes: %v", err)
+	}
+	return b
 }
